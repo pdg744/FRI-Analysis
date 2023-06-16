@@ -1,0 +1,112 @@
+# RISC Zero Soundness Analysis
+(from the folks at Ulvetanna)
+
+The goal is to concretely compute the overall error estimate $\varepsilon_{\text{IOP}}$ from the [[RISC Zero](https://www.risczero.com/proof-system-in-detail.pdf)] spec.
+
+Let's begin by defining some global constants, which depend only on the proof system. These are all taken directly from the spec, with the exception of `h` and `L`, which we obtained by inspecting [the open-source code](https://github.com/risc0/risc0).
+import math
+
+k = 2  # negative log of the rate.
+rho = 1 / (1 << k)  # rate.
+h = 18  # log of the trace length. this value refers to the chess example.
+H = 1 << h  # domain size.
+D = H / rho  # domain size, after low-degree extension.
+e = 4  # field extension degree.
+p = (1 << 32) - (1 << 27) + 1  # field characteristic: Baby Bear prime.
+F = math.pow(p, e)  # extension field size.
+C = 16 + 222 + 36  # number of control, data, and accumulation columns, respectively. retrieved from `circuit.get_taps()`, etc.
+L = C + 4  # number of polynomials which ultimately appear in the FRI batch. we need to add 4 extra columns, for the "segment polynomials".
+s = 50  # number of FRI queries.
+The parameter `m` below is the "Johnson parameter"; see [[Haböck](https://eprint.iacr.org/2022/1216.pdf)]. This one is subtle, since it doesn't appear directly in the protocol at all; rather, it only appears in the soundness estimates. We have chosen it to here _optimize_ the number of bits of provable security achieved. We comment on this further below.
+m = 16
+alpha = (1 + 1 / (2 * m)) * math.sqrt(rho)
+theta = 1 - alpha
+### Provable Soundness
+
+The below error terms reflect the _proven_ / known soundness, and derive from Theorem 1.2 of [[Proximity Gaps](https://eprint.iacr.org/2020/654.pdf)]. The below expressions are based on [[Haböck](https://eprint.iacr.org/2022/1216.pdf)] and [[RISC Zero](https://www.risczero.com/proof-system-in-detail.pdf)], which are in agreement.
+e_proximity_gap = math.pow(m + 1/2, 7) / (3 * math.pow(rho, 3/2)) * math.pow(D, 2) / F
+e_FRI_constant = (L - 1/2) * e_proximity_gap + (2 * m + 1) * (D + 1) * 16 * math.floor((h + 2) / 4 - 2) / (math.sqrt(rho) * F)
+e_FRI_queries = math.pow(1 - theta, s)
+e_FRI = e_FRI_constant + e_FRI_queries
+In the next couple terms, we'll need the Guruswami–Sudan list-size quantity $L^+$ from [[Haböck](https://eprint.iacr.org/2022/1216.pdf)]. Note that there is a bit of notational confusion here; the RISC Zero spec uses the letter $\mathsf{L}$ to refer to _both_ the number of columns $L$ _and_ to the Guruswami–Sudan list size $L^+$. Of course these are different quantities (with unfortunately similar names).
+
+There's a further subtlety. In order for the proof of [[Haböck](https://eprint.iacr.org/2022/1216.pdf), Theorem 8] to go through, we need to apply FRI with proximity parameter $\theta < 1 - \sqrt{\rho^+}$ (note the +!). In particular, we can't choose `m` _too_ large, or else $\theta := 1 - \sqrt{\rho} \cdot \left( 1 + \frac{1}{2 \cdot m} \right)$ will become larger than $1 - \sqrt{\rho^+}$, and the key step in that theorem will fail. Specifically, the relevant _configuration's_ distance from Reed–Solomon code $\mathsf{RS}_{k^+}(K, D)$ over the function field $K := F(Z)$ will exceed the Johnson bound of that code. For our parameters, this doesn't happen until `m = 131073`, so we have plenty of room.
+
+Separately, when we calculate $L^+$, we need to use a _different_ `m` than the one up above. Specifically, we need to use $m^+$, say, where $m^+$ is chosen sufficiently large that $\theta \leq 1 - \sqrt{\rho^+} \cdot \left( 1 + \frac{1}{2 \cdot m^+} \right)$ holds. This fact is not explicit in [[Haböck](https://eprint.iacr.org/2022/1216.pdf), Theorem 8], and appears to have been an oversight.
+
+Let's calculate a minimal suitable $m^+$:
+rho_plus = (H + 2) / D  # modified rate of "extension code" in function field; controls the agreement we actually need
+assert theta < 1 - math.sqrt(rho_plus)  # make sure `m` isn't too large.
+m_plus = math.ceil(1 / (2 * (alpha / math.sqrt(rho_plus) - 1)))
+assert theta <= 1 - math.sqrt(rho_plus) * (1 + 1 / (2 * m_plus))
+m_plus
+Thus right now, we only get a difference of 1 between $m$ and $m^+$, but this becomes much more significant as $\theta$ asymptotically approaches $1 - \sqrt{\rho^+}$!
+L_plus = (m_plus + 1/2) / math.sqrt(rho_plus)  # note the use of m_plus here.
+
+e_ALI = L_plus * C / F
+e_DEEP = L_plus * (4 * (H + 1) + (H - 1)) / (F - H - D)
+e_PLONK = e * 5 * H / F  # 5 comes from n_{σ_{mem}} == 5.
+e_PLOOKUP = e * 15 * H / F  # n_{σ_{bytes}} == 15.
+
+e_IOP = e_FRI + e_ALI + e_DEEP + e_PLONK + e_PLOOKUP
+math.log(e_IOP, 2)
+Thus we appear get around ~47 bits of provable security, overall. Note that our choice `m = 16` actually optimizes this number. Indeed, the results go through for _each possible_ `m`; thus, we are free to choose `m` so as to make the result as good as possible. This is a tradeoff, for various reasons. Indeed, as `m` grows, `e_FRI_constant` gets higher (worse), but `e_FRI_queries` gets lower (better).
+
+The individual values are collected in the table below:
+import numpy as np
+import pandas as pd
+
+def show_table():
+    err_terms = pd.DataFrame(
+        [
+            ["e_FRI_constant", e_FRI_constant],
+            ["e_FRI_queries", e_FRI_queries],
+            ["e_ALI", e_ALI],
+            ["e_DEEP", e_DEEP],
+            ["e_PLONK", e_PLONK],
+            ["e_PLOOKUP", e_PLOOKUP],
+        ],
+        columns=["Term", "P[err]"]
+    )
+    err_terms["log_2(P[err])"] = np.log2(err_terms["P[err]"])
+    err_terms = err_terms.drop(columns="P[err]")
+    return err_terms
+show_table()
+### Conjectured Soundness
+
+Actually, it's not hard to see that, with the rate `rho = 1/4`, it will not be possible to achieve more than 50 bits of soundness (barring an increase in the number of trials `s = 50`), _even_ assuming Conjecture 8.4 of [[Proximity Gaps](https://eprint.iacr.org/2020/654.pdf)]. Indeed, with these parameters, we have $\log_2 \left( \epsilon_{\text{FRI-queries}} \right) = s \cdot \log_2 \left( \left( 1 + \frac{1}{2 \cdot m} \right) \cdot \frac{1}{2} \right) \geq -s$, where the latter holds even in the limit as $m \rightarrow \infty$. Paradoxically, the larger proximity parameters Conjecture 8.4 makes possible—i.e., in the range $\theta \geq 1 - \sqrt{\rho}$—don't help us here, _unless_ we also make further conjectures about the list-decodability of Reed–Solomon codes up to capacity. Sure enough, the proof of [[Haböck](https://eprint.iacr.org/2022/1216.pdf), Theorem 8] relies on the list-decodability of the Reed–Solomon code $\mathsf{RS}_{k^+}(K, D)$, where $K := F(Z)$ is the infinite function field over $F$ in one indeterminate. This latter list decodability will fail as soon as $\theta \geq 1 - \sqrt{\rho^+}$.
+
+Thus, to make progress, we need to additionally assume [[DEEP-FRI](https://eprint.iacr.org/2019/336.pdf), Conjecture 2.3]. As a digression, we note that this conjecture seems highly unlikely to be proven soon; in fact, our best-known explicit constructions of capacity-achieving codes are far more complicated than standard Reed–Solomon codes; we refer example to [[Guruswami](https://www.nowpublishers.com/article/Details/TCS-007)].
+
+In any case, let's proceed, now assuming [[Proximity Gaps](https://eprint.iacr.org/2020/654.pdf), Conjecture 8.4] _and_ [[DEEP-FRI](https://eprint.iacr.org/2019/336.pdf), Conjecture 2.3]. The latter conjecture in turn depends on an unspecified constant `C_rho`, depending only on `rho`.
+c_1 = 1  # first parameter in Proximity Gaps, Conjecture 8.4
+c_2 = 1  # second parameter in Proximity Gaps, Conjecture 8.4
+C_rho = 1  # unpsecified exponent parameter in DEEP-FRI, Conjecture 2.3
+
+epsilon = 0.05  # also called "eta" in Proximity Gaps
+theta = 1 - rho - epsilon  # new proximity parameter! overwrites old one.
+assert theta < 1 - rho_plus  # can't exceed the capacity of RS_{k⁺}(K, D).
+epsilon_plus = 1 - rho_plus - theta
+e_proximity_gap = 1 / math.pow(epsilon * rho, c_1) * L * math.pow(D, c_2) / F  # new value, from Proximity Gaps, Conjecture 8.4
+e_FRI_constant = (L - 1/2) * e_proximity_gap + (2 * m + 1) * (D + 1) * 16 * math.floor((h + 2) / 4 - 2) / (math.sqrt(rho) * F)  # add folding error
+e_FRI_queries = math.pow(1 - theta, s)  # now using the new, better theta!
+e_FRI = e_FRI_constant + e_FRI_queries
+
+L_plus = math.ceil(math.pow(D / epsilon_plus, C_rho))
+L_plus
+We note that this is a huge number; indeed, in the setting of [[DEEP-FRI](https://eprint.iacr.org/2019/336.pdf), Conjecture 2.3], the list size depends on the domain size `D`. This wasn't true for the original list size `L_plus` above; indeed, the Guruswami–Sudan list size depends only on the rate and the proximity parameter, but not on the message or block length! As a separate note, since we need to perform list decoding in $\mathsf{RS}_{k^+}(K, D)$, we need to compute the list size $L^+$ based on $\varepsilon^+$, not on $\varepsilon$.
+
+We're implicitly using [[DEEP-FRI](https://eprint.iacr.org/2019/336.pdf), Conjecture 2.3], here, in order for the analogue of [[Haböck](https://eprint.iacr.org/2022/1216.pdf), Thm. 8] to go through. Indeed, [[DEEP-FRI](https://eprint.iacr.org/2019/336.pdf), Conjecture 2.3] here allows us to assert that, even at the proximity parameter $\theta = 1 - \rho - \varepsilon$—as long as $\theta < 1 - \rho^+$ holds—we still get list-decodability in $\mathsf{RS}_{k^+}(K, D)$, where the list size $L^+$, just calculated above, again comes from [[DEEP-FRI](https://eprint.iacr.org/2019/336.pdf), Conjecture 2.3]. Let's proceed:
+e_ALI = L_plus * C / F
+e_DEEP = L_plus * (4 * (H + 1) + (H - 1)) / (F - H - D)
+e_PLONK = e * 5 * H / F  # 5 comes from n_{σ_{mem}} == 5.
+e_PLOOKUP = e * 15 * H / F  # n_{σ_{bytes}} == 15.
+
+e_IOP = e_FRI + e_ALI + e_DEEP + e_PLONK + e_PLOOKUP
+math.log(e_IOP, 2)
+Thus we can see that we're getting much better security under the various conjectures. Note that this soundness is very sensitive to $\varepsilon$. (Slimmer $\varepsilon$ means _higher_ $\theta$, and hence better soundness from the queries; but it also means bigger list size, and hence worse soundness for DEEP-ALI.) We have chosen $\varepsilon$ to make this soudness as high as possible.
+
+The soudness is also very sensitive to the unspecified exponents `C_rho`, `c_1` and `c_2` in the conjectures. For example, if we increase `C_rho` to 2, we see that the amount of security we'd get drops to ~59 bits (though can in turn be improved to 60 bits by relaxing $\varepsilon$ to 0.1).
+
+For ease of reading, we've collected all of the relevant soundness levels in the table below.
+show_table()
